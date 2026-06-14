@@ -102,6 +102,46 @@ class MarketData:
         except Exception:
             return False
 
+    def get_chain_slice(self, expiry: str, spot: float, n: int = 6) -> dict:
+        try:
+            chain = self.ticker.option_chain(expiry)
+            puts = chain.puts
+            calls = chain.calls
+
+            def _nearest_n(df: pd.DataFrame, n: int) -> pd.DataFrame:
+                if df is None or df.empty:
+                    return df
+                dist = (df["strike"] - spot).abs()
+                atm_idx = dist.idxmin()
+                atm_pos = df.index.get_loc(atm_idx)
+                half = n // 2
+                lo = max(0, atm_pos - half)
+                hi = min(len(df), atm_pos + half)
+                # Expand window if we hit a boundary
+                if hi - lo < n:
+                    hi = min(len(df), lo + n)
+                    lo = max(0, hi - n)
+                return df.iloc[lo:hi]
+
+            put_slice = _nearest_n(puts, n)
+            call_slice = _nearest_n(calls, n)
+
+            def _rows(df: pd.DataFrame) -> list:
+                result = []
+                for _, row in df.iterrows():
+                    result.append({
+                        "strike": self._safe_float(row, "strike"),
+                        "bid":    self._safe_float(row, "bid"),
+                        "ask":    self._safe_float(row, "ask"),
+                        "oi":     self._safe_int(row, "openInterest"),
+                        "iv":     self._safe_float(row, "impliedVolatility"),
+                    })
+                return result
+
+            return {"puts": _rows(put_slice), "calls": _rows(call_slice)}
+        except Exception:
+            return {"puts": [], "calls": []}
+
     def scan(self) -> dict:
         spot = self.get_current_price()
 
@@ -135,6 +175,7 @@ class MarketData:
 
         iv_rank = self.compute_iv_rank(current_iv)
         earnings_warning = self.check_earnings_warning()
+        chain_slice = self.get_chain_slice(weekly_expiry, spot)
 
         return {
             "symbol": self.symbol,
@@ -149,6 +190,7 @@ class MarketData:
             "iv_rank": iv_rank,
             "open_interest": max_oi,
             "earnings_warning": earnings_warning,
+            "chain_slice": chain_slice,
         }
 
     def _get_chain(self, expiry: str):

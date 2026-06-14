@@ -131,6 +131,14 @@ class SentimentAgent:
                     sector_results[sector] = {**_FALLBACK_MARKET, "sector": sector}
                     continue
 
+                most_recent_ts = unique_news[0].get("providerPublishTime", 0) if unique_news else 0
+                age_hours = (datetime.datetime.now().timestamp() - most_recent_ts) / 3600
+                if age_hours > 48:
+                    logger.info(f"Sector {sector}: most recent headline is {age_hours:.0f}h old — defaulting to neutral")
+                    sector_results[sector] = {**_FALLBACK_MARKET, "sector": sector,
+                                              "summary": f"No recent news (>{age_hours:.0f}h old). Defaulting to neutral."}
+                    continue
+
                 headline_lines = []
                 for item in unique_news:
                     title = item.get("title", "")
@@ -145,16 +153,22 @@ class SentimentAgent:
                     model="claude-haiku-4-5-20251001",
                     max_tokens=512,
                     system=(
-                        f"You are a sector equity analyst. Classify sentiment for the {sector} sector "
-                        "as bullish, neutral, or bearish based on recent news. "
-                        "Focus on: earnings beats/misses vs analyst expectations, revenue/EPS guidance "
-                        "vs consensus, analyst upgrades/downgrades, supply-chain or regulatory news, "
-                        "and major product/competitive developments. "
+                        f"You are a sector equity analyst. Assess the {sector} sector's "
+                        "current sentiment relative to 30 days ago — is the sector trending "
+                        "better (bullish), worse (bearish), or about the same (neutral)? "
+                        "Base your answer ONLY on concrete evidence in the headlines: "
+                        "recent earnings beats or misses vs analyst expectations, guidance "
+                        "raised or lowered vs consensus, analyst upgrades or downgrades, "
+                        "M&A or major product news, regulatory rulings. "
+                        "If no concrete evidence of a directional change is present in the "
+                        "headlines, return neutral. Do not infer direction from price moves "
+                        "alone. "
                         "Return ONLY valid JSON:\n"
                         "{\n"
                         f'  "sector": "{sector}",\n'
                         '  "sentiment": "bullish|neutral|bearish",\n'
                         '  "confidence": "high|medium|low",\n'
+                        '  "evidence": "specific headline or event that drove this classification, or none",\n'
                         '  "key_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],\n'
                         '  "summary": "<2-sentence plain-English summary>"\n'
                         "}"

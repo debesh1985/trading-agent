@@ -70,20 +70,40 @@ Summary          : {mkt_summary}
 Industry Sentiment is provided per-ticker in the market data below.
 
 ── STRATEGY SELECTION MATRIX ──────────────────────────────
-Use the market + industry sentiment combination to restrict which strategies
-are considered for each ticker. Only pitch strategies from the allowed column:
+Use the market + industry sentiment combination as the PRIMARY filter,
+then use per-ticker signals (IV rank, price trend) as the SECONDARY
+selector when multiple strategies are allowed.
 
-Market \\ Industry │ Bullish                        │ Neutral                 │ Bearish
-──────────────────┼────────────────────────────────┼─────────────────────────┼───────────────────────
-Bullish           │ Bull Call Spread, Put Credit   │ Put Credit Spread       │ Iron Condor
-                  │ Spread                         │                         │
-Neutral           │ Put Credit Spread              │ Iron Condor             │ Call Credit Spread
-Bearish           │ Iron Condor                    │ Call Credit Spread,     │ Bear Put Spread,
-                  │                                │ Bear Put Spread         │ Call Credit Spread
-──────────────────────────────────────────────────────────────────────────────────────────────────────
-If earnings_warning is true for a ticker, prefer Iron Condor or skip the ticker
-regardless of sentiment — undefined direction risk overrides the matrix.
-─────────────────────────────────────────────────────────────
+PRIMARY — allowed strategies per sentiment cell:
+
+Market \\ Industry │ Bullish                              │ Neutral                        │ Bearish
+──────────────────┼──────────────────────────────────────┼────────────────────────────────┼──────────────────────────
+Bullish           │ Bull Call Spread, Put Credit Spread  │ Put Credit Spread              │ Iron Condor
+Neutral           │ Put Credit Spread, Bull Call Spread  │ ANY defined-risk spread*       │ Call Credit Spread, Bear Put Spread
+Bearish           │ Iron Condor                          │ Call Credit Spread, Bear Put   │ Bear Put Spread, Call Credit Spread
+                  │                                      │ Spread                         │
+──────────────────────────────────────────────────────────────────────────────────────────────
+
+*Neutral/Neutral: All five strategies are permitted. Use SECONDARY rules
+ below to pick the most appropriate one per ticker.
+
+SECONDARY — for Neutral/Neutral (or when multiple strategies are allowed):
+- IV rank >= 50 → prefer credit strategies (Put Credit Spread,
+  Call Credit Spread, Iron Condor) to sell elevated premium
+- IV rank < 50  → prefer debit strategies (Bull Call Spread,
+  Bear Put Spread) where premium is cheaper
+- price_change_pct > +0.5% (upward momentum) → bias toward bullish
+  strategies (Put Credit Spread, Bull Call Spread)
+- price_change_pct < -0.5% (downward momentum) → bias toward bearish
+  strategies (Call Credit Spread, Bear Put Spread)
+- price_change_pct between -0.5% and +0.5% (flat) → Iron Condor
+- earnings_warning = true → Iron Condor only, regardless of sentiment
+
+IMPORTANT: Do NOT default to Iron Condor just because sentiment is
+neutral. Use the secondary rules above to pick a directional strategy
+where the data supports it. Iron Condor is only the right choice when
+momentum is flat AND/OR earnings_warning is true.
+───────────────────────────────────────────────────────────────────────
 
 FILTERING RULES:
 - Skip any ticker with open interest < 100 on the relevant strikes
@@ -121,6 +141,29 @@ Each object must contain:
 }}
 
 For iron_condor, breakeven is a list: [lower_breakeven, upper_breakeven]
+
+── STRIKE SELECTION (MANDATORY) ──────────────────────────
+Each ticker's market data includes a "chain_slice" field with real
+options chain data: actual strikes, bids, asks, and open interest.
+
+YOU MUST select strikes ONLY from the strikes listed in chain_slice.
+Do NOT invent or estimate strikes. If chain_slice is empty for a ticker,
+skip that ticker entirely.
+
+For credit spreads: choose the short strike from chain_slice where
+  bid >= 0.05 AND oi >= 100. Choose the long strike one step away.
+  Net credit = short_mid - long_mid  (mid = (bid+ask)/2 for each leg)
+
+For debit spreads: choose the long strike near ATM, short strike one
+  step OTM. Net debit = long_ask - short_bid.
+
+For iron condors: choose put short strike below spot (bid >= 0.05, oi >= 100)
+  and call short strike above spot (bid >= 0.05, oi >= 100), each with
+  a protective long one step further OTM.
+
+Use the actual mid-price ( (bid+ask)/2 ) for net_credit_or_debit.
+Report open_interest from the chain_slice row matching your short strike.
+──────────────────────────────────────────────────────────────
 
 CALCULATION REMINDERS (all USD):
 - put_credit_spread / call_credit_spread: max_loss = (width - net_credit) x 100
