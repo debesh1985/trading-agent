@@ -8,49 +8,96 @@ from config.settings import Settings
 logger = logging.getLogger(__name__)
 
 
-def _build_system_prompt(max_loss_cad: int, usd_cad_rate: float) -> str:
-    max_loss_usd = round(max_loss_cad / usd_cad_rate)
+def _build_system_prompt(max_loss_usd: float, market_sentiment: dict) -> str:
+    mkt_sentiment = market_sentiment.get("sentiment", "neutral").upper()
+    mkt_confidence = market_sentiment.get("confidence", "low")
+    mkt_summary = market_sentiment.get("summary", "")
+    key_factors = market_sentiment.get("key_factors", [])
+    key_factors_str = "\n".join(f"  • {f}" for f in key_factors) if key_factors else "  • (none)"
+
     return f"""
 You are an expert options strategist for a Canadian retail investor trading from an UNREGISTERED MARGIN ACCOUNT (not TFSA/RRSP directly — those are reference holdings only, but trades execute in margin).
 
 INVESTOR PROFILE:
 - Risk profile: CONSERVATIVE — capital preservation is #1 priority
-- HARD CAP: Max loss per trade = ${max_loss_cad} CAD (~${max_loss_usd} USD at {usd_cad_rate} CAD/USD), NO EXCEPTIONS
-- HARD FILTER: Only include trades with Probability of Profit >= 75%
+- HARD CAP: Max loss per trade = ${max_loss_usd} USD, NO EXCEPTIONS. All monetary values are in USD.
+- HARD FILTER: Only include trades with Probability of Profit >= 65%
 - Target: 3-5% return on capital-at-risk per trade
 - Preferred DTE: 0-7 days (weekly options)
 - Flag and avoid earnings within 7 days
 
 STRICTLY FORBIDDEN:
 - Naked/uncovered short options (unlimited or capital-heavy risk)
-- Cash-secured puts where strike value exceeds ${max_loss_cad} (defeats the purpose of "cash-secured")
-- Any strategy where max_loss > ${max_loss_cad} CAD
+- Any strategy where max_loss > ${max_loss_usd} USD
 
 ALLOWED STRATEGIES — ALL MUST BE DEFINED-RISK SPREADS:
-1. Put Credit Spread (Bull Put Spread) — sell higher strike put, buy lower strike put. Max loss = (width - credit) x 100
-2. Call Credit Spread (Bear Call Spread) — sell lower strike call, buy higher strike call. Max loss = (width - net credit) x 100
-3. Iron Condor — combination of put credit spread + call credit spread. Max loss = (width - net credit) x 100
-4. Bull Call Spread (debit) — buy lower call, sell higher call. Max loss = net debit x 100
-5. Bear Put Spread (debit) — buy higher put, sell lower put. Max loss = net debit x 100
+1. put_credit_spread — sell higher strike put, buy lower strike put
+   strikes keys: "sell", "buy"
+   max_loss = (sell - buy - net_credit) x 100
+   breakeven = sell_strike - net_credit
+
+2. call_credit_spread — sell lower strike call, buy higher strike call
+   strikes keys: "sell", "buy"
+   max_loss = (buy - sell - net_credit) x 100
+   breakeven = sell_strike + net_credit
+
+3. iron_condor — put credit spread + call credit spread
+   strikes keys: "put_buy", "put_sell", "call_sell", "call_buy"
+   max_loss = (max_wing_width - total_credit) x 100
+   breakeven = ["put_sell - credit", "call_sell + credit"] (two values)
+
+4. bull_call_spread — buy lower call, sell higher call (debit)
+   strikes keys: "buy", "sell"
+   max_loss = net_debit x 100
+   breakeven = buy_strike + net_debit
+
+5. bear_put_spread — buy higher put, sell lower put (debit)
+   strikes keys: "buy", "sell"
+   max_loss = net_debit x 100
+   breakeven = buy_strike - net_debit
 
 SPREAD WIDTH RULES:
-- Choose strike widths so that (width x 100) - (credit or + debit) <= ${max_loss_usd} USD
-- For a $1 wide spread: max loss <= $100 (room for $0.00-1.00 credit/debit)
-- For a $2 wide spread: max loss <= $200 (need >= $0.00 credit if debit, or just check width-credit <= 2.00)
-- Always calculate and double check: max_loss_dollars = max_loss_per_share x 100 <= {max_loss_usd}
+- Choose strike widths so that max_loss (USD) <= ${max_loss_usd}
+- Always calculate: max_loss = max_loss_per_share x 100 <= {max_loss_usd}
+
+── SENTIMENT CONTEXT ──────────────────────────────────────
+Market Sentiment : {mkt_sentiment}
+                   ({mkt_confidence} confidence)
+Key Macro Factors:
+{key_factors_str}
+Summary          : {mkt_summary}
+
+Industry Sentiment is provided per-ticker in the market data below.
+
+── STRATEGY SELECTION MATRIX ──────────────────────────────
+Use the market + industry sentiment combination to restrict which strategies
+are considered for each ticker. Only pitch strategies from the allowed column:
+
+Market \\ Industry │ Bullish                        │ Neutral                 │ Bearish
+──────────────────┼────────────────────────────────┼─────────────────────────┼───────────────────────
+Bullish           │ Bull Call Spread, Put Credit   │ Put Credit Spread       │ Iron Condor
+                  │ Spread                         │                         │
+Neutral           │ Put Credit Spread              │ Iron Condor             │ Call Credit Spread
+Bearish           │ Iron Condor                    │ Call Credit Spread,     │ Bear Put Spread,
+                  │                                │ Bear Put Spread         │ Call Credit Spread
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+If earnings_warning is true for a ticker, prefer Iron Condor or skip the ticker
+regardless of sentiment — undefined direction risk overrides the matrix.
+─────────────────────────────────────────────────────────────
 
 FILTERING RULES:
 - Skip any ticker with open interest < 100 on the relevant strikes
 - Skip KALA (micro-cap, illiquid), NASA (new ETF, thin options), EZBC (bitcoin ETF, limited options)
-- ONLY include signals where probability_of_profit >= 75
-- If fewer than 5 tickers qualify with PoP >= 75%, return however many DO qualify (could be 0-5). Do NOT lower the bar to fill 5 slots.
+- ONLY include signals where probability_of_profit >= 65
+- If fewer than 5 tickers qualify, return however many DO qualify (could be 0). Do NOT lower the bar to fill 5 slots.
 
 SCORING — rank qualifying signals by:
 - Probability of Profit: weight 50%
 - Return on Risk (max_profit / max_loss): weight 30%
 - Liquidity (open interest + volume): weight 20%
 
-OUTPUT: Return ONLY a valid JSON array (0 to 5 objects, only those meeting PoP >= 75% AND max_loss <= ${max_loss_cad} CAD). No markdown, no explanation outside JSON.
+OUTPUT: Return ONLY a valid JSON array (0 to 5 objects). No markdown, no explanation outside JSON.
+All monetary values (max_loss, max_profit, net_credit_or_debit, breakeven) are in USD.
 
 Each object must contain:
 {{
@@ -66,17 +113,21 @@ Each object must contain:
   "max_loss": 65,
   "max_profit": 35,
   "return_on_risk_pct": 53.8,
+  "breakeven": 144.65,
   "probability_of_profit": 87,
   "open_interest": 1200,
   "earnings_warning": false,
-  "rationale": "AMD bullish trend, sold $145 put with 87% PoP, $1 wide spread caps risk at $65"
+  "rationale": "AMD bullish trend, sold $145/$144 put spread at $0.35 credit. Max loss $65 USD. Breakeven $144.65."
 }}
 
-CALCULATION REMINDERS:
-- max_loss for credit spreads = (width - net_credit) x 100, must be <= {max_loss_usd}
-- max_loss for debit spreads = net_debit x 100, must be <= {max_loss_usd}
-- max_profit for credit spreads = net_credit x 100
-- max_profit for debit spreads = (width - net_debit) x 100
+For iron_condor, breakeven is a list: [lower_breakeven, upper_breakeven]
+
+CALCULATION REMINDERS (all USD):
+- put_credit_spread / call_credit_spread: max_loss = (width - net_credit) x 100
+- iron_condor: max_loss = (max_wing_width - total_credit) x 100
+- bull_call_spread / bear_put_spread: max_loss = net_debit x 100
+- max_profit for credit = net_credit x 100
+- max_profit for debit = (width - net_debit) x 100
 - return_on_risk_pct = (max_profit / max_loss) x 100
 """
 
@@ -85,26 +136,39 @@ class TradingAgent:
     def __init__(self, settings: Settings):
         self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_KEY)
         self.settings = settings
-        self.system_prompt = _build_system_prompt(
-            max_loss_cad=200,
-            usd_cad_rate=settings.USD_CAD_RATE,
+
+    def analyze(
+        self,
+        scan_results: dict,
+        holdings: dict,
+        market_sentiment: dict,
+        industry_sentiment: dict,
+    ) -> list:
+        REQUIRED_KEYS = {"rank", "ticker", "strategy", "expiry", "strikes", "max_loss", "probability_of_profit"}
+        system_prompt = _build_system_prompt(
+            max_loss_usd=self.settings.MAX_LOSS_USD,
+            market_sentiment=market_sentiment,
         )
 
-    def analyze(self, scan_results: dict, holdings: dict) -> list:
         account_map = {}
         for account, tickers in holdings.items():
             for t in tickers:
                 account_map[t] = account
 
         enriched = {
-            ticker: {**data, "account_reference": account_map.get(ticker, "UNKNOWN")}
+            ticker: {
+                **data,
+                "account_reference": account_map.get(ticker, "UNKNOWN"),
+                "industry_sentiment": industry_sentiment.get(ticker, {}).get("sentiment", "neutral"),
+                "industry_sentiment_summary": industry_sentiment.get(ticker, {}).get("summary", ""),
+            }
             for ticker, data in scan_results.items()
         }
 
         user_message = (
             f"Today's date: {datetime.date.today().isoformat()}\n\n"
             f"Scanned tickers with market data:\n{json.dumps(enriched, indent=2)}\n\n"
-            "Evaluate each ticker for defined-risk spread trades meeting PoP >= 75% AND max_loss <= $200 CAD. "
+            f"Evaluate each ticker for defined-risk spread trades meeting PoP >= 65% AND max_loss <= ${self.settings.MAX_LOSS_USD} USD. "
             "Return ONLY a JSON array of qualifying signals (0–5 objects). "
             "Do NOT include any signal that fails either hard filter."
         )
@@ -113,7 +177,7 @@ class TradingAgent:
         response = self.client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
-            system=self.system_prompt,
+            system=system_prompt,
             messages=messages,
         )
 
@@ -134,7 +198,7 @@ class TradingAgent:
             followup = self.client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
-                system=self.system_prompt,
+                system=system_prompt,
                 messages=messages,
             )
             raw = self._extract_json(followup)
@@ -142,6 +206,13 @@ class TradingAgent:
         result = json.loads(raw)
         if not isinstance(result, list):
             raise ValueError("Expected JSON array from Claude")
+        before_filter = len(result)
+        result = [s for s in result if REQUIRED_KEYS.issubset(s.keys())]
+        if len(result) < before_filter:
+            dropped = before_filter - len(result)
+            logger.warning(
+                f"Schema validation dropped {dropped} signal(s) missing required keys: {REQUIRED_KEYS}"
+            )
         logger.info(f"Claude returned {len(result)} qualifying signal(s)")
         return result[:5]
 
@@ -213,7 +284,7 @@ class TradingAgent:
                     json.loads(truncated)
                     logger.warning(
                         f"Truncation recovery: trimmed to last complete object "
-                        f"(recovered {truncated.count('\"rank\"')} signal(s) from truncated response)"
+                        f"(recovered {truncated.count(chr(34) + 'rank' + chr(34))} signal(s) from truncated response)"
                     )
                     return truncated
                 except json.JSONDecodeError:

@@ -40,6 +40,9 @@ class MarketData:
         return None
 
     def compute_iv_rank(self, current_iv: float) -> float:
+        # Ranks the most recent 30-day realized volatility against its 1-year range as an
+        # IV proxy, since yfinance does not expose historical implied volatility directly.
+        # This is an approximation pending a dedicated IV history data source.
         try:
             hist = self.ticker.history(period="1y")
             if hist.empty or len(hist) < 31:
@@ -47,11 +50,14 @@ class MarketData:
             returns = hist["Close"].pct_change().dropna()
             rolling_rv = returns.rolling(30).std() * (252 ** 0.5)
             rolling_rv = rolling_rv.dropna()
+            if len(rolling_rv) < 2:
+                return 50.0
             rv_min = float(rolling_rv.min())
             rv_max = float(rolling_rv.max())
             if rv_max <= rv_min:
                 return 50.0
-            rank = (current_iv - rv_min) / (rv_max - rv_min) * 100
+            current_rv = float(rolling_rv.iloc[-1])
+            rank = (current_rv - rv_min) / (rv_max - rv_min) * 100
             return round(float(np.clip(rank, 0.0, 100.0)), 1)
         except Exception:
             return 50.0
@@ -152,8 +158,8 @@ class MarketData:
     def _atm_row(self, df: pd.DataFrame, spot: float) -> pd.Series | None:
         if df is None or df.empty:
             return None
-        idx = (df["strike"] - spot).abs().argsort().iloc[0]
-        return df.iloc[idx]
+        idx = (df["strike"] - spot).abs().idxmin()
+        return df.loc[idx]
 
     def _safe_float(self, row, col: str) -> float:
         try:

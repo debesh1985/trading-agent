@@ -18,6 +18,8 @@ class Settings:
     RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "0.02"))
     MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
     USD_CAD_RATE: float = float(os.getenv("USD_CAD_RATE", "1.38"))
+    MAX_LOSS_USD: float = float(os.getenv("MAX_LOSS_USD", "145.0"))  # ~$200 CAD at 1.38
+    MIN_POP: int = int(os.getenv("MIN_POP", "65"))
 
     LOG_DIR: str = "logs"
     LOG_FILE: str = "logs/trade_signals.log"

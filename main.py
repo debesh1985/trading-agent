@@ -1,8 +1,6 @@
 import sys
 import os
 import logging
-import schedule
-import time
 import json
 from datetime import date, datetime
 
@@ -20,6 +18,7 @@ from data.market_data import scan_all_tickers
 from portfolio.holdings import HOLDINGS
 from agent.claude_agent import TradingAgent
 from alerts.notifications import AlertManager
+from sentiment.sentiment_agent import SentimentAgent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +38,8 @@ STRATEGY_LABELS = {
     "bear_put_spread": "Bear Put Spread",
 }
 
-MAX_LOSS_CAD = 200
-MIN_POP = 75
+MAX_LOSS_USD = 145   # hard cap in USD (~$200 CAD at 1.38); read from settings at runtime
+MIN_POP = 65
 
 ET = ZoneInfo("America/New_York")
 
@@ -55,7 +54,98 @@ def is_market_open() -> bool:
     return market_open <= now < market_close
 
 
-def validate_signals(signals: list) -> list:
+def compute_payoff(signal: dict) -> dict:
+    """
+    Derives max_loss, max_profit, breakeven, and return_on_risk_pct from
+    strikes and net premium using each strategy's payoff matrix.
+    All values are in USD. Overrides Claude's self-reported numbers.
+    Returns an empty dict if computation fails (missing keys, bad types).
+    """
+    strategy = signal.get("strategy", "")
+    strikes = signal.get("strikes", {})
+    net = float(signal.get("net_credit_or_debit", 0) or 0)
+
+    try:
+        if strategy == "put_credit_spread":
+            sell, buy = float(strikes["sell"]), float(strikes["buy"])
+            width = sell - buy
+            if width <= 0:
+                raise ValueError(f"put_credit_spread strikes misordered: sell={sell} buy={buy}")
+            max_loss  = round((width - net) * 100, 2)
+            if max_loss <= 0:
+                raise ValueError("max_loss must be positive — credit may exceed spread width or strikes are misordered")
+            max_profit = round(net * 100, 2)
+            breakeven  = round(sell - net, 2)
+
+        elif strategy == "call_credit_spread":
+            sell, buy = float(strikes["sell"]), float(strikes["buy"])
+            width = buy - sell
+            if width <= 0:
+                raise ValueError(f"call_credit_spread strikes misordered: sell={sell} buy={buy}")
+            max_loss  = round((width - net) * 100, 2)
+            if max_loss <= 0:
+                raise ValueError("max_loss must be positive — credit may exceed spread width or strikes are misordered")
+            max_profit = round(net * 100, 2)
+            breakeven  = round(sell + net, 2)
+
+        elif strategy == "iron_condor":
+            ps = float(strikes.get("put_sell",  strikes.get("sell_put",  0)))
+            pb = float(strikes.get("put_buy",   strikes.get("buy_put",   0)))
+            cs = float(strikes.get("call_sell", strikes.get("sell_call", 0)))
+            cb = float(strikes.get("call_buy",  strikes.get("buy_call",  0)))
+            put_width  = ps - pb
+            call_width = cb - cs
+            if put_width <= 0 or call_width <= 0:
+                raise ValueError(f"iron_condor wing misordered: put_width={put_width} call_width={call_width}")
+            max_wing   = max(put_width, call_width)
+            max_loss   = round((max_wing - net) * 100, 2)
+            if max_loss <= 0:
+                raise ValueError("max_loss must be positive — credit may exceed spread width or strikes are misordered")
+            max_profit = round(net * 100, 2)
+            breakeven  = f"${round(ps - net, 2)} / ${round(cs + net, 2)}"
+            width = max_wing
+
+        elif strategy == "bull_call_spread":
+            buy, sell = float(strikes["buy"]), float(strikes["sell"])
+            width = sell - buy
+            if width <= 0:
+                raise ValueError(f"bull_call_spread strikes misordered: buy={buy} sell={sell}")
+            max_loss  = round(net * 100, 2)
+            if max_loss <= 0:
+                raise ValueError("max_loss must be positive — credit may exceed spread width or strikes are misordered")
+            max_profit = round((width - net) * 100, 2)
+            breakeven  = round(buy + net, 2)
+
+        elif strategy == "bear_put_spread":
+            buy, sell = float(strikes["buy"]), float(strikes["sell"])
+            width = buy - sell
+            if width <= 0:
+                raise ValueError(f"bear_put_spread strikes misordered: buy={buy} sell={sell}")
+            max_loss  = round(net * 100, 2)
+            if max_loss <= 0:
+                raise ValueError("max_loss must be positive — credit may exceed spread width or strikes are misordered")
+            max_profit = round((width - net) * 100, 2)
+            breakeven  = round(buy - net, 2)
+
+        else:
+            logger.warning(f"Unknown strategy '{strategy}' — skipping payoff computation")
+            return {}
+
+        ror = round(max_profit / max_loss * 100, 1) if max_loss > 0 else 0.0
+        return {
+            "max_loss": max_loss,
+            "max_profit": max_profit,
+            "breakeven": breakeven,
+            "return_on_risk_pct": ror,
+            "width": width,
+        }
+
+    except (KeyError, TypeError, ZeroDivisionError, ValueError) as e:
+        logger.warning(f"Payoff computation failed for {signal.get('ticker')} ({strategy}): {e}")
+        return {}
+
+
+def validate_signals(signals: list, max_loss_usd: float) -> list:
     valid = []
     for s in signals:
         pop = s.get("probability_of_profit", 0)
@@ -65,9 +155,15 @@ def validate_signals(signals: list) -> list:
                 f"EXCLUDED {s.get('ticker')} — PoP {pop}% is below {MIN_POP}% minimum"
             )
             continue
-        if max_loss > MAX_LOSS_CAD:
+        if max_loss > max_loss_usd:
             logger.warning(
-                f"EXCLUDED {s.get('ticker')} — max_loss ${max_loss} exceeds ${MAX_LOSS_CAD} CAD cap"
+                f"EXCLUDED {s.get('ticker')} — max_loss ${max_loss} USD exceeds ${max_loss_usd} USD cap"
+            )
+            continue
+        if s.get("earnings_warning") and s.get("strategy") not in ("iron_condor",):
+            logger.warning(
+                f"EXCLUDED {s.get('ticker')} — directional spread submitted "
+                f"despite earnings_warning=True (strategy: {s.get('strategy')})"
             )
             continue
         valid.append(s)
@@ -89,11 +185,16 @@ def print_scan_summary(analyzed: dict, skipped: dict):
     print()
 
 
-def print_signals_table(signals: list):
+def print_signals_table(signals: list, market_sentiment: dict):
     print("=" * 70)
+    print(f"  MARKET SENTIMENT  : {market_sentiment.get('sentiment', 'neutral').upper()} "
+          f"({market_sentiment.get('confidence', 'low')} confidence)")
+    print(f"  {market_sentiment.get('summary', '')}")
+    print()
+
     if not signals:
         print("  NO QUALIFYING SIGNALS TODAY")
-        print(f"  No trades met the {MIN_POP}% PoP + ${MAX_LOSS_CAD} CAD max loss criteria.")
+        print(f"  No trades met the {MIN_POP}% PoP + ${MAX_LOSS_USD} USD max loss criteria.")
         print("=" * 70)
         print()
         return
@@ -102,8 +203,8 @@ def print_signals_table(signals: list):
     print(f"  TOP {count} SIGNAL{'S' if count > 1 else ''}")
     print("=" * 70)
 
-    col = [5, 7, 8, 20, 16, 12, 7, 8, 9, 8, 5]
-    headers = ["#", "Ticker", "Acct", "Strategy", "Strikes", "Expiry", "Width", "Credit", "MaxLoss", "RoR%", "PoP%"]
+    col = [5, 7, 8, 20, 16, 12, 7, 8, 9, 20, 8, 5]
+    headers = ["#", "Ticker", "Acct", "Strategy", "Strikes", "Expiry", "Width", "Credit", "MaxLoss", "Breakeven", "RoR%", "PoP%"]
     sep = "+" + "+".join("-" * (w + 2) for w in col) + "+"
     header_row = "|" + "|".join(f" {h:<{w}} " for h, w in zip(headers, col)) + "|"
 
@@ -120,6 +221,8 @@ def print_signals_table(signals: list):
         net = s.get("net_credit_or_debit", 0) or 0
         credit_str = f"${net:.2f}{'cr' if direction == 'credit' else 'db'}"
         ror = s.get("return_on_risk_pct", 0) or 0
+        be = s.get("breakeven", "—")
+        be_str = str(be)[:19] if not isinstance(be, str) else be[:19]
         row_vals = [
             f"#{s['rank']}",
             f"{s['ticker']}{earn}",
@@ -130,6 +233,7 @@ def print_signals_table(signals: list):
             f"${s.get('width', '?')}",
             credit_str,
             f"${s['max_loss']}",
+            be_str,
             f"{ror:.1f}%",
             f"{s['probability_of_profit']}%",
         ]
@@ -196,6 +300,17 @@ def run_analysis(settings: Settings, agent: TradingAgent, alerts: AlertManager):
     tickers = [t.strip() for t in settings.TICKERS.split(",")]
     logger.info(f"Starting scan for {len(tickers)} tickers: {', '.join(tickers)}")
 
+    # Step 0: Sentiment
+    sentiment_agent = SentimentAgent(settings)
+    logger.info("Fetching market sentiment...")
+    market_sentiment = sentiment_agent.get_market_sentiment()
+    logger.info(
+        f"Market sentiment: {market_sentiment.get('sentiment', 'neutral').upper()} "
+        f"({market_sentiment.get('confidence', 'low')} confidence) — {market_sentiment.get('summary', '')}"
+    )
+    logger.info("Fetching industry sentiment...")
+    industry_sentiment = sentiment_agent.get_industry_sentiment(tickers)
+
     # Step 1: Scan market data
     scan_results, skipped = scan_all_tickers(tickers)
     print_scan_summary(scan_results, skipped)
@@ -208,27 +323,35 @@ def run_analysis(settings: Settings, agent: TradingAgent, alerts: AlertManager):
     # Step 2: Claude analysis
     logger.info(f"Sending {len(scan_results)} tickers to Claude for analysis...")
     try:
-        raw_signals = agent.analyze(scan_results, HOLDINGS)
+        raw_signals = agent.analyze(scan_results, HOLDINGS, market_sentiment, industry_sentiment)
     except Exception as e:
         logger.error(f"Claude analysis failed: {e}", exc_info=True)
         alerts.error_alert(f"Claude analysis error: {e}")
         return
 
-    # Step 3: Validate hard filters client-side
-    signals = validate_signals(raw_signals)
+    # Step 3: Compute payoff matrix client-side and override Claude's self-reported values
+    for s in raw_signals:
+        payoff = compute_payoff(s)
+        if payoff:
+            s.update(payoff)
+        else:
+            logger.warning(f"Payoff matrix unavailable for {s.get('ticker')} — using Claude's values")
+
+    # Step 4: Validate hard filters against verified payoff values
+    signals = validate_signals(raw_signals, settings.MAX_LOSS_USD)
     excluded = len(raw_signals) - len(signals)
     if excluded:
         logger.warning(f"{excluded} signal(s) excluded by client-side validation")
 
-    # Step 4: Print console table
-    print_signals_table(signals)
+    # Step 5: Print console table
+    print_signals_table(signals, market_sentiment)
 
-    # Step 5: Supabase (with dedup)
+    # Step 6: Supabase (with dedup)
     scan_date = date.today().isoformat()
     log_to_supabase(settings, signals, scan_date)
 
-    # Step 6: Email
-    alerts.send_trade_signals_email(signals, scan_results, skipped, scan_date)
+    # Step 7: Email
+    alerts.send_trade_signals_email(signals, scan_results, skipped, scan_date, market_sentiment, industry_sentiment)
     logger.info("Analysis complete.")
 
 
@@ -253,11 +376,6 @@ def main():
 
     logger.info("Trading agent started.")
     maybe_run_analysis(settings, agent, alerts)
-
-    schedule.every(30).minutes.do(maybe_run_analysis, settings, agent, alerts)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
 
 
 if __name__ == "__main__":
