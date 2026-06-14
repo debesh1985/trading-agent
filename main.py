@@ -203,7 +203,7 @@ def print_signals_table(signals: list, market_sentiment: dict):
     print(f"  TOP {count} SIGNAL{'S' if count > 1 else ''}")
     print("=" * 70)
 
-    col = [5, 7, 8, 20, 16, 12, 7, 8, 9, 20, 8, 5]
+    col = [5, 7, 8, 20, 22, 12, 7, 8, 9, 20, 8, 5]
     headers = ["#", "Ticker", "Acct", "Strategy", "Strikes", "Expiry", "Width", "Credit", "MaxLoss", "Breakeven", "RoR%", "PoP%"]
     sep = "+" + "+".join("-" * (w + 2) for w in col) + "+"
     header_row = "|" + "|".join(f" {h:<{w}} " for h, w in zip(headers, col)) + "|"
@@ -228,7 +228,7 @@ def print_signals_table(signals: list, market_sentiment: dict):
             f"{s['ticker']}{earn}",
             s.get("account_reference", "—")[:7],
             strategy_label,
-            strikes_str[:15],
+            strikes_str[:21],
             s["expiry"],
             f"${s.get('width', '?')}",
             credit_str,
